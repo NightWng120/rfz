@@ -102,6 +102,36 @@ list_source() {   # list_source QUERY LIMIT(0 = unlimited)
                         "query=$1" "limit=$2"
 }
 
+# ---- browse-mode helpers (-b) ------------------------------------------------
+list_dir() {   # list_dir RELDIR -> one-level listing of ROOT/RELDIR
+  local r=$root
+  if [[ -n $1 ]]; then r="${root%/}/$1"; fi
+  run_sh "$LIST_SCRIPT" "root=$r" "shallow=1" "ignore=$ignore" "query=" "limit=0"
+}
+
+toggle_basket() {   # toggle_basket NAME -> add/remove ROOT-relative path
+  local name=$1 cwd full
+  if [[ $name == "../" ]]; then return 0; fi
+  cwd=$(cat "${RFZ_CWDFILE:-/dev/null}")
+  full=${cwd:+$cwd/}$name
+  if grep -Fxq -- "$full" "$RFZ_BASKET"; then
+    grep -Fxv -- "$full" "$RFZ_BASKET" > "$RFZ_BASKET.new" || true
+    mv "$RFZ_BASKET.new" "$RFZ_BASKET"
+  else
+    printf '%s\n' "$full" >> "$RFZ_BASKET"
+  fi
+}
+
+browse_header() {
+  local cwd disp
+  cwd=$(cat "$RFZ_CWDFILE")
+  disp=${root%/}${cwd:+/$cwd}
+  [[ -n $disp ]] || disp=/
+  printf '%s%s -> %s   |   basket: %s\n' "${host:+$host:}" "$disp" "${RFZ_DEST:-?}" \
+    "$(wc -l < "$RFZ_BASKET" | tr -d ' ')"
+  printf 'Enter: open/pick  Tab: pick  ^B: up  ^U: clear basket  ^T: transfer  Esc: quit\n'
+}
+
 # State shared by the normal flow and the hidden helper modes fzf calls back.
 host=""; root="."; shallow=0; ignore=0
 ssh_cmd=(ssh); patterns=()
@@ -127,7 +157,12 @@ case ${1:-} in
     exit 0 ;;
   __preview)                      # __preview PATH  -> preview over SSH
     load_env
-    run_sh "$PREVIEW_SCRIPT" "root=$root" "f=${2:-}" || true
+    pf=${2:-}
+    if [[ $pf == "../" ]]; then exit 0; fi
+    if [[ -n ${RFZ_CWDFILE:-} ]]; then
+      pc=$(cat "$RFZ_CWDFILE"); pf=${pc:+$pc/}$pf
+    fi
+    run_sh "$PREVIEW_SCRIPT" "root=$root" "f=$pf" || true
     exit 0 ;;
   __basket)                       # __basket add PATH | clear  -> live-mode basket
     b=${RFZ_BASKET:?}
@@ -135,8 +170,46 @@ case ${1:-} in
       add)   printf '%s\n' "${3:-}" >> "$b" ;;
       clear) : > "$b" ;;
     esac
-    printf 'basket: %s item(s)  |  Tab: add  Ctrl-U: clear  Enter: done\n' \
-      "$(wc -l < "$b" | tr -d ' ')"
+    if [[ -n ${RFZ_CWDFILE:-} ]]; then
+      load_env; browse_header
+    else
+      printf 'basket: %s item(s)  |  Tab: add  Ctrl-U: clear  Enter: done\n' \
+        "$(wc -l < "$b" | tr -d ' ')"
+    fi
+    exit 0 ;;
+  __ls)                           # list the current browse directory
+    load_env
+    cwd=$(cat "$RFZ_CWDFILE")
+    if [[ -n $cwd ]]; then echo '../'; fi
+    out=$(list_dir "$cwd" | LC_ALL=C sort) || true
+    if [[ -n $out ]]; then
+      printf '%s\n' "$out" | grep '/$' || true      # directories first
+      printf '%s\n' "$out" | grep -v '/$' || true
+    fi
+    exit 0 ;;
+  __enter)                        # Enter: descend / go up / toggle a file
+    load_env
+    q=$(printf '%q' "$RFZ_SELF"); name=${2:-}
+    if [[ -z $name ]]; then exit 0; fi
+    cwd=$(cat "$RFZ_CWDFILE")
+    case $name in
+      ../) if [[ $cwd == */* ]]; then cwd=${cwd%/*}; else cwd=""; fi ;;
+      */)  cwd=${cwd:+$cwd/}${name%/} ;;
+      *)   toggle_basket "$name"
+           printf 'transform-header(%s __header)+down' "$q"
+           exit 0 ;;
+    esac
+    printf '%s' "$cwd" > "$RFZ_CWDFILE"
+    printf 'clear-query+reload(%s __ls)+transform-header(%s __header)' "$q" "$q"
+    exit 0 ;;
+  __toggle)                       # Tab: toggle item in basket, print header
+    load_env
+    toggle_basket "${2:-}"
+    browse_header
+    exit 0 ;;
+  __header)
+    load_env
+    browse_header
     exit 0 ;;
 esac
 
@@ -152,6 +225,7 @@ SOURCE is a local dir or [user@]host:path. DEST may be local or remote.
 
 Options:
   -l          Live mode: search on the server per keystroke (huge trees)
+  -b          Browse mode: navigate directories one level at a time
   -s          Shallow: only the top level of SOURCE
   -n          Dry run (rsync --dry-run)
   -y          Skip the confirmation prompt
@@ -164,6 +238,8 @@ Options:
   -h          Show this help
 
 Keys (default mode):  Tab select  |  Ctrl-A all  |  Ctrl-D none  |  Enter done
+Keys (browse mode):   Enter open dir / pick file  |  Tab pick  |  Ctrl-B up
+                      Ctrl-U clear basket  |  Ctrl-T transfer  |  Esc quit
 Keys (live mode):     Tab add to basket  |  Ctrl-U clear  |  Enter done
                       (Enter uses the basket, or the highlighted item if empty)
 
@@ -174,12 +250,13 @@ Examples:
 EOF
 }
 
-live=0; dry=0; assume_yes=0; query=""; ssh_base="ssh"; preview=1; mux=1
+live=0; browse=0; dry=0; assume_yes=0; query=""; ssh_base="ssh"; preview=1; mux=1
 rs_excl=()
 
-while getopts ":lsnyIx:q:e:PMh" opt; do
+while getopts ":lbsnyIx:q:e:PMh" opt; do
   case $opt in
     l) live=1 ;;
+    b) browse=1 ;;
     s) shallow=1 ;;
     n) dry=1 ;;
     y) assume_yes=1 ;;
@@ -240,6 +317,7 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 excl_joined=""
 if (( ${#patterns[@]} )); then excl_joined=$(printf '%s\n' "${patterns[@]}"); fi
 export RFZ_HOST="$host" RFZ_ROOT="$root" RFZ_SHALLOW="$shallow" RFZ_IGNORE="$ignore"
+export RFZ_SELF="$SELF" RFZ_DEST="$dest"
 export RFZ_SSH="${ssh_cmd[*]}" RFZ_EXCL="$excl_joined" RFZ_BASKET="$tmp/basket"
 : > "$RFZ_BASKET"
 qself=$(printf '%q' "$SELF")
@@ -254,7 +332,30 @@ fzf_args=(
 [[ -n $query ]] && fzf_args+=(--query="$query")
 
 # ---- 1+2. List and select ----------------------------------------------------
-if (( live )); then
+if (( browse )); then
+  export RFZ_CWDFILE="$tmp/cwd"; : > "$RFZ_CWDFILE"
+  browse_args=(
+    --height=90% --reverse --border --prompt='browse> '
+    --bind="start:reload($qself __ls)+transform-header($qself __header)"
+    --bind="enter:transform($qself __enter {})"
+    --bind="ctrl-b:transform($qself __enter ../)"
+    --bind="tab:transform-header($qself __toggle {})+down"
+    --bind="ctrl-u:transform-header($qself __basket clear)"
+    --bind="ctrl-t:accept"
+  )
+  (( preview )) && browse_args+=(--preview "$qself __preview {}"
+                                 --preview-window='down,40%,wrap,border-top')
+  [[ -n $query ]] && browse_args+=(--query="$query")
+  printf 'Browsing %s (needs fzf >= 0.45)\n' "$src_rsync" >&2
+  rc=0
+  fzf "${browse_args[@]}" </dev/null >/dev/null || rc=$?
+  # Only Ctrl-T (accept, rc 0) transfers; Esc/Ctrl-C aborts.
+  if (( rc == 0 )) && [[ -s $RFZ_BASKET ]]; then
+    awk '!seen[$0]++' "$RFZ_BASKET" > "$picked"
+  else
+    : > "$picked"
+  fi
+elif (( live )); then
   fzf_args+=(
     --disabled
     --header="$src -> $dest   |   Tab: add to basket  Ctrl-U: clear  Enter: done"
