@@ -1,0 +1,305 @@
+#!/usr/bin/env bash
+#
+# rfz - fuzzy-find files over SSH, then transfer only what you pick with rsync.
+#
+#   * One SSH connection is opened and reused (ControlMaster/ControlPersist),
+#     so listing, previews and the final transfer all skip the handshake.
+#   * Files are listed on the server with `fd` (or POSIX `find` as fallback).
+#   * Default mode: load the whole listing, fuzzy-filter locally in fzf.
+#   * Live mode (-l): fzf runs a server-side search on every keystroke, so a
+#     huge tree is never downloaded.
+#
+# Requires: bash, ssh, rsync, fzf.  Optional on the server: fd / fdfind.
+# Works in Termux (pkg install openssh rsync fzf fd).
+
+set -euo pipefail
+
+# ----------------------------------------------------------------------------
+# Server-side scripts. They run under plain `sh` on the source machine, fed via
+# stdin, so no quoting issues and no dependency on the remote login shell.
+# Variables (root, shallow, ignore, query, limit, f) are prepended by run_sh,
+# and "$@" holds the exclude globs.
+# ----------------------------------------------------------------------------
+read -r -d '' LIST_SCRIPT <<'EOS' || true
+case $root in
+  "~")   root=$HOME ;;
+  "~/"*) root=$HOME/${root#"~/"} ;;
+esac
+cd -- "$root" 2>/dev/null || { echo "rfz: cannot cd to $root" >&2; exit 2; }
+cap() { if [ "$limit" -gt 0 ]; then head -n "$limit"; else cat; fi; }
+
+FD=
+for c in fd fdfind; do
+  if command -v "$c" >/dev/null 2>&1; then FD=$c; break; fi
+done
+
+n=$#; i=0
+if [ -n "$FD" ]; then
+  while [ "$i" -lt "$n" ]; do
+    p=$1; shift; set -- "$@" --exclude "$p"; i=$((i + 1))
+  done
+  set -- --hidden "$@"
+  [ "$ignore" = 1 ] || set -- --no-ignore "$@"
+  [ "$shallow" = 1 ] && set -- --max-depth 1 "$@"
+  {
+    "$FD" "$@" -t d -- "$query" </dev/null 2>/dev/null | sed 's|/*$|/|'
+    "$FD" "$@" -t f -t l -- "$query" </dev/null 2>/dev/null
+  } | cap
+else
+  while [ "$i" -lt "$n" ]; do
+    p=$1; shift; set -- "$@" ! -path "*/$p" ! -path "*/$p/*"; i=$((i + 1))
+  done
+  depth=; [ "$shallow" = 1 ] && depth="-maxdepth 1"
+  name='*'; [ -n "$query" ] && name="*$query*"
+  {
+    find . -mindepth 1 $depth "$@" -type d -iname "$name" </dev/null 2>/dev/null |
+      sed -e 's|^\./||' -e 's|/*$|/|'
+    find . -mindepth 1 $depth "$@" ! -type d -iname "$name" </dev/null 2>/dev/null |
+      sed -e 's|^\./||'
+  } | cap
+fi
+EOS
+
+read -r -d '' PREVIEW_SCRIPT <<'EOS' || true
+case $root in
+  "~")   root=$HOME ;;
+  "~/"*) root=$HOME/${root#"~/"} ;;
+esac
+cd -- "$root" 2>/dev/null || exit 0
+if [ -d "$f" ]; then
+  ls -la -- "$f" 2>&1 | head -n 60
+else
+  ls -ld -- "$f" 2>&1
+  if [ -f "$f" ]; then
+    a=$(head -c 2048 -- "$f" | wc -c)
+    b=$(head -c 2048 -- "$f" | tr -d '\000' | wc -c)
+    if [ "$a" = "$b" ]; then echo; head -c 4096 -- "$f"; else echo "(binary file)"; fi
+  fi
+fi
+EOS
+
+# ----------------------------------------------------------------------------
+# Helpers
+# ----------------------------------------------------------------------------
+die() { printf 'rfz: %s\n' "$*" >&2; exit 1; }
+
+# run_sh SCRIPT [NAME=value ...]
+# Run SCRIPT with `sh -s` on the source side (over the shared SSH connection
+# for remote sources), defining the given variables and exclude globs first.
+run_sh() {
+  local script=$1 kv; shift
+  {
+    printf 'set --'
+    if (( ${#patterns[@]} )); then printf ' %q' "${patterns[@]}"; fi
+    printf '\n'
+    for kv in "$@"; do printf '%s=%q\n' "${kv%%=*}" "${kv#*=}"; done
+    printf '%s\n' "$script"
+  } | if [[ -n $host ]]; then "${ssh_cmd[@]}" -- "$host" sh -s; else sh -s; fi
+}
+
+list_source() {   # list_source QUERY LIMIT(0 = unlimited)
+  run_sh "$LIST_SCRIPT" "root=$root" "shallow=$shallow" "ignore=$ignore" \
+                        "query=$1" "limit=$2"
+}
+
+# State shared by the normal flow and the hidden helper modes fzf calls back.
+host=""; root="."; shallow=0; ignore=0
+ssh_cmd=(ssh); patterns=()
+
+load_env() {
+  host=${RFZ_HOST:-}; root=${RFZ_ROOT:-.}
+  shallow=${RFZ_SHALLOW:-0}; ignore=${RFZ_IGNORE:-0}
+  read -ra ssh_cmd <<<"${RFZ_SSH:-ssh}"
+  patterns=()
+  local p
+  while IFS= read -r p; do
+    if [[ -n $p ]]; then patterns+=("$p"); fi
+  done <<<"${RFZ_EXCL:-}"
+}
+
+# ----------------------------------------------------------------------------
+# Hidden modes (called by fzf via bindings; not for direct use)
+# ----------------------------------------------------------------------------
+case ${1:-} in
+  __search)                       # __search QUERY  -> live server-side search
+    load_env
+    list_source "${2:-}" 3000 || true
+    exit 0 ;;
+  __preview)                      # __preview PATH  -> preview over SSH
+    load_env
+    run_sh "$PREVIEW_SCRIPT" "root=$root" "f=${2:-}" || true
+    exit 0 ;;
+  __basket)                       # __basket add PATH | clear  -> live-mode basket
+    b=${RFZ_BASKET:?}
+    case ${2:-} in
+      add)   printf '%s\n' "${3:-}" >> "$b" ;;
+      clear) : > "$b" ;;
+    esac
+    printf 'basket: %s item(s)  |  Tab: add  Ctrl-U: clear  Enter: done\n' \
+      "$(wc -l < "$b" | tr -d ' ')"
+    exit 0 ;;
+esac
+
+# ----------------------------------------------------------------------------
+# Normal flow
+# ----------------------------------------------------------------------------
+usage() {
+  cat <<'EOF'
+Usage: rfz [options] SOURCE DEST [-- extra rsync args]
+
+Fuzzy-pick files/directories from SOURCE and rsync them to DEST.
+SOURCE is a local dir or [user@]host:path. DEST may be local or remote.
+
+Options:
+  -l          Live mode: search on the server per keystroke (huge trees)
+  -s          Shallow: only the top level of SOURCE
+  -n          Dry run (rsync --dry-run)
+  -y          Skip the confirmation prompt
+  -I          Respect .gitignore/.ignore files when listing (needs fd)
+  -x PATTERN  Exclude glob (repeatable), e.g. -x .git -x '*.log'
+  -q QUERY    Initial fzf query
+  -e CMD      SSH command, e.g. -e "ssh -p 2222 -i ~/.ssh/key"
+  -P          Disable the preview pane
+  -M          Disable SSH connection multiplexing
+  -h          Show this help
+
+Keys (default mode):  Tab select  |  Ctrl-A all  |  Ctrl-D none  |  Enter done
+Keys (live mode):     Tab add to basket  |  Ctrl-U clear  |  Enter done
+                      (Enter uses the basket, or the highlighted item if empty)
+
+Examples:
+  rfz user@host:/var/log/ ~/logs
+  rfz -l -x .git host:/srv/media/ ~/storage/downloads
+  rfz -n -s host:~ ./home-copy -- --bwlimit=2000
+EOF
+}
+
+live=0; dry=0; assume_yes=0; query=""; ssh_base="ssh"; preview=1; mux=1
+rs_excl=()
+
+while getopts ":lsnyIx:q:e:PMh" opt; do
+  case $opt in
+    l) live=1 ;;
+    s) shallow=1 ;;
+    n) dry=1 ;;
+    y) assume_yes=1 ;;
+    I) ignore=1 ;;
+    x) patterns+=("$OPTARG"); rs_excl+=("--exclude=$OPTARG") ;;
+    q) query=$OPTARG ;;
+    e) ssh_base=$OPTARG ;;
+    P) preview=0 ;;
+    M) mux=0 ;;
+    h) usage; exit 0 ;;
+    :) die "option -$OPTARG needs an argument" ;;
+    \?) die "unknown option -$OPTARG (try -h)" ;;
+  esac
+done
+shift $((OPTIND - 1))
+
+[[ $# -ge 2 ]] || { usage >&2; exit 1; }
+src=$1; dest=$2; shift 2
+[[ ${1:-} == "--" ]] && shift
+extra=("$@")
+
+command -v rsync >/dev/null || die "rsync not found"
+command -v fzf   >/dev/null || die "fzf not found (https://github.com/junegunn/fzf)"
+
+# Split SOURCE into host + root.
+if [[ $src == rsync://* ]]; then
+  die "rsync:// daemon sources aren't supported; use host:path over SSH"
+elif [[ $src == *:* && $src != /* && $src != ./* && $src != ../* ]]; then
+  host=${src%%:*}; root=${src#*:}
+else
+  root=$src
+fi
+[[ -n $root ]] || root="."
+[[ $root == "/" ]] || root=${root%/}
+[[ -n $root ]] || root="/"
+if [[ -z $host && ! -d $root ]]; then die "not a directory: $root"; fi
+
+src_rsync="${host:+$host:}$root"
+[[ $src_rsync == */ ]] || src_rsync+="/"
+
+# SSH with connection multiplexing: one handshake, reused for everything.
+read -ra ssh_cmd <<<"$ssh_base"
+if (( mux )); then
+  mux_dir=${XDG_RUNTIME_DIR:-$HOME/.ssh}
+  mkdir -p "$mux_dir"; chmod 700 "$mux_dir" 2>/dev/null || true
+  ssh_cmd+=(-o ControlMaster=auto
+            -o "ControlPath=$mux_dir/cm-%C"
+            -o ControlPersist=10m)
+fi
+ssh_cmd+=(-o ServerAliveInterval=30 -o ServerAliveCountMax=3)
+
+tmp=$(mktemp -d)
+trap 'rm -rf "$tmp"' EXIT
+picked="$tmp/picked"
+
+# Environment for the hidden helper modes fzf calls back into.
+SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+excl_joined=""
+if (( ${#patterns[@]} )); then excl_joined=$(printf '%s\n' "${patterns[@]}"); fi
+export RFZ_HOST="$host" RFZ_ROOT="$root" RFZ_SHALLOW="$shallow" RFZ_IGNORE="$ignore"
+export RFZ_SSH="${ssh_cmd[*]}" RFZ_EXCL="$excl_joined" RFZ_BASKET="$tmp/basket"
+: > "$RFZ_BASKET"
+qself=$(printf '%q' "$SELF")
+
+fzf_args=(
+  --multi --height=90% --reverse --border
+  --prompt='rsync> '
+  --bind='ctrl-a:select-all,ctrl-d:deselect-all'
+)
+(( preview )) && fzf_args+=(--preview "$qself __preview {}"
+                            --preview-window='down,40%,wrap,border-top')
+[[ -n $query ]] && fzf_args+=(--query="$query")
+
+# ---- 1+2. List and select ----------------------------------------------------
+if (( live )); then
+  fzf_args+=(
+    --disabled
+    --header="$src -> $dest   |   Tab: add to basket  Ctrl-U: clear  Enter: done"
+    --bind="start:reload($qself __search {q} || true)"
+    --bind="change:reload(sleep 0.2; $qself __search {q} || true)"
+    --bind="tab:transform-header($qself __basket add {})+down"
+    --bind="ctrl-u:transform-header($qself __basket clear)"
+  )
+  printf 'Live search on %s (needs fzf >= 0.38)\n' "$src" >&2
+  fzf "${fzf_args[@]}" </dev/null > "$tmp/fzf_out" || true
+
+  if [[ -s $RFZ_BASKET ]]; then
+    awk '!seen[$0]++' "$RFZ_BASKET" > "$picked"
+  else
+    cp "$tmp/fzf_out" "$picked"
+  fi
+else
+  printf 'Listing %s ...\n' "$src_rsync" >&2
+  list_source "" 0 | LC_ALL=C sort > "$tmp/listing" \
+    || die "could not list $src_rsync"
+  [[ -s $tmp/listing ]] || die "nothing found at $src_rsync"
+
+  fzf_args+=(--header="$src -> $dest   |   Tab: select  Enter: done")
+  fzf "${fzf_args[@]}" < "$tmp/listing" > "$picked" || true
+fi
+
+[[ -s $picked ]] || { echo "Nothing selected." >&2; exit 0; }
+count=$(wc -l < "$picked" | tr -d ' ')
+
+# ---- 3. Confirm and transfer -------------------------------------------------
+printf '\nSelected %s item(s):\n' "$count" >&2
+head -n 15 "$picked" | sed 's/^/  /' >&2
+(( count > 15 )) && printf '  ... and %s more\n' "$((count - 15))" >&2
+
+if (( ! assume_yes )); then
+  read -r -p "Transfer to $dest? [y/N] " ans </dev/tty
+  [[ $ans =~ ^[Yy]$ ]] || { echo "Aborted." >&2; exit 0; }
+fi
+
+# With --files-from, -a doesn't imply -r, so pass -r so picked dirs recurse.
+# rsync -e is split on spaces, so ssh options here must not contain spaces.
+cmd=(rsync -ahr --info=progress2 --partial --files-from="$picked"
+     -e "${ssh_cmd[*]}")
+(( dry )) && cmd+=(--dry-run --itemize-changes)
+cmd+=(${rs_excl[@]+"${rs_excl[@]}"} ${extra[@]+"${extra[@]}"} "$src_rsync" "$dest")
+
+printf '\n+ %q ' "${cmd[@]}" >&2; echo >&2
+"${cmd[@]}"
