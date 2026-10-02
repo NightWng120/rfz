@@ -111,7 +111,7 @@ list_dir() {   # list_dir RELDIR -> one-level listing of ROOT/RELDIR
 
 toggle_basket() {   # toggle_basket NAME -> add/remove ROOT-relative path
   local name=$1 cwd full
-  if [[ $name == "../" ]]; then return 0; fi
+  if [[ -z $name || $name == "../" ]]; then return 0; fi
   cwd=$(cat "${RFZ_CWDFILE:-/dev/null}")
   full=${cwd:+$cwd/}$name
   if grep -Fxq -- "$full" "$RFZ_BASKET"; then
@@ -122,6 +122,26 @@ toggle_basket() {   # toggle_basket NAME -> add/remove ROOT-relative path
   fi
 }
 
+browse_nav() {   # browse_nav NAME -> enter dir/ or go up (../); returns 1 otherwise
+  local name=$1 cwd q
+  cwd=$(cat "$RFZ_CWDFILE")
+  case $name in
+    ../) if [[ $cwd == */* ]]; then cwd=${cwd%/*}; else cwd=""; fi ;;
+    */)  cwd=${cwd:+$cwd/}${name%/} ;;
+    *)   return 1 ;;
+  esac
+  printf '%s' "$cwd" > "$RFZ_CWDFILE"
+  q=$(printf '%q' "$RFZ_SELF")
+  printf 'clear-query+reload(%s __ls)+transform-header(%s __header)' "$q" "$q"
+}
+
+browse_refresh() {   # redraw list+header, keeping the cursor row (arg = rows to step)
+  local q pos=""
+  q=$(printf '%q' "$RFZ_SELF")
+  if [[ -n ${FZF_POS:-} ]]; then pos="+pos($(( FZF_POS + ${1:-0} )))"; fi
+  printf 'reload-sync(%s __ls)%s+transform-header(%s __header)' "$q" "$pos" "$q"
+}
+
 browse_header() {
   local cwd disp
   cwd=$(cat "$RFZ_CWDFILE")
@@ -129,7 +149,7 @@ browse_header() {
   [[ -n $disp ]] || disp=/
   printf '%s%s -> %s   |   basket: %s\n' "${host:+$host:}" "$disp" "${RFZ_DEST:-?}" \
     "$(wc -l < "$RFZ_BASKET" | tr -d ' ')"
-  printf 'Enter: open/pick  Tab: pick  ^B: up  ^U: clear basket  ^T: transfer  Esc: quit\n'
+  printf 'Tab: mark (+)  Enter: transfer  Right: open dir  Left: up  ^U: clear  Esc: quit\n'
 }
 
 # State shared by the normal flow and the hidden helper modes fzf calls back.
@@ -158,8 +178,9 @@ case ${1:-} in
   __preview)                      # __preview PATH  -> preview over SSH
     load_env
     pf=${2:-}
-    if [[ $pf == "../" ]]; then exit 0; fi
-    if [[ -n ${RFZ_CWDFILE:-} ]]; then
+    if [[ -n ${RFZ_CWDFILE:-} ]]; then      # browse mode: drop the 2-char mark
+      pf=${pf:2}
+      if [[ $pf == "../" ]]; then exit 0; fi
       pc=$(cat "$RFZ_CWDFILE"); pf=${pc:+$pc/}$pf
     fi
     run_sh "$PREVIEW_SCRIPT" "root=$root" "f=$pf" || true
@@ -177,35 +198,41 @@ case ${1:-} in
         "$(wc -l < "$b" | tr -d ' ')"
     fi
     exit 0 ;;
-  __ls)                           # list the current browse directory
+  __ls)                           # list the current browse directory (+ = in basket)
     load_env
     cwd=$(cat "$RFZ_CWDFILE")
-    if [[ -n $cwd ]]; then echo '../'; fi
-    out=$(list_dir "$cwd" | LC_ALL=C sort) || true
-    if [[ -n $out ]]; then
-      printf '%s\n' "$out" | grep '/$' || true      # directories first
-      printf '%s\n' "$out" | grep -v '/$' || true
-    fi
+    {
+      if [[ -n $cwd ]]; then echo '../'; fi
+      out=$(list_dir "$cwd" | LC_ALL=C sort) || true
+      if [[ -n $out ]]; then
+        printf '%s\n' "$out" | grep '/$' || true      # directories first
+        printf '%s\n' "$out" | grep -v '/$' || true
+      fi
+    } | awk -v pre="${cwd:+$cwd/}" '
+          FILENAME == ARGV[1] { b[$0] = 1; next }
+          { print ((pre $0) in b ? "+ " : "  ") $0 }' "$RFZ_BASKET" -
     exit 0 ;;
-  __enter)                        # Enter: descend / go up / toggle a file
+  __enter)                        # Right/Left/Ctrl-B: open dir or go up
     load_env
-    q=$(printf '%q' "$RFZ_SELF"); name=${2:-}
-    if [[ -z $name ]]; then exit 0; fi
-    cwd=$(cat "$RFZ_CWDFILE")
-    case $name in
-      ../) if [[ $cwd == */* ]]; then cwd=${cwd%/*}; else cwd=""; fi ;;
-      */)  cwd=${cwd:+$cwd/}${name%/} ;;
-      *)   toggle_basket "$name"
-           printf 'transform-header(%s __header)+down' "$q"
-           exit 0 ;;
-    esac
-    printf '%s' "$cwd" > "$RFZ_CWDFILE"
-    printf 'clear-query+reload(%s __ls)+transform-header(%s __header)' "$q" "$q"
+    name=${2:2}
+    if [[ -n $name ]]; then browse_nav "$name" || true; fi
     exit 0 ;;
-  __toggle)                       # Tab: toggle item in basket, print header
+  __accept)                       # Enter: transfer (or go up on ../)
     load_env
-    toggle_basket "${2:-}"
-    browse_header
+    name=${2:2}
+    if [[ $name == "../" ]]; then browse_nav "$name"; exit 0; fi
+    if [[ ! -s $RFZ_BASKET && -n $name ]]; then toggle_basket "$name"; fi
+    if [[ -s $RFZ_BASKET ]]; then printf 'accept'; fi
+    exit 0 ;;
+  __toggle)                       # Tab: mark/unmark, redraw, step down
+    load_env
+    toggle_basket "${2:2}"
+    browse_refresh 1
+    exit 0 ;;
+  __clear)                        # Ctrl-U: empty the basket
+    load_env
+    : > "$RFZ_BASKET"
+    browse_refresh 0
     exit 0 ;;
   __header)
     load_env
@@ -238,8 +265,8 @@ Options:
   -h          Show this help
 
 Keys (default mode):  Tab select  |  Ctrl-A all  |  Ctrl-D none  |  Enter done
-Keys (browse mode):   Enter open dir / pick file  |  Tab pick  |  Ctrl-B up
-                      Ctrl-U clear basket  |  Ctrl-T transfer  |  Esc quit
+Keys (browse mode):   Tab mark/unmark (+)  |  Enter transfer marked (or highlighted)
+                      Right open dir  |  Left / Ctrl-B up  |  Ctrl-U clear  |  Esc quit
 Keys (live mode):     Tab add to basket  |  Ctrl-U clear  |  Enter done
                       (Enter uses the basket, or the highlighted item if empty)
 
@@ -337,11 +364,12 @@ if (( browse )); then
   browse_args=(
     --height=90% --reverse --border --prompt='browse> '
     --bind="start:reload($qself __ls)+transform-header($qself __header)"
-    --bind="enter:transform($qself __enter {})"
-    --bind="ctrl-b:transform($qself __enter ../)"
-    --bind="tab:transform-header($qself __toggle {})+down"
-    --bind="ctrl-u:transform-header($qself __basket clear)"
-    --bind="ctrl-t:accept"
+    --bind="enter:transform($qself __accept {})"
+    --bind="right:transform($qself __enter {})"
+    --bind="left:transform($qself __enter '  ../')"
+    --bind="ctrl-b:transform($qself __enter '  ../')"
+    --bind="tab:transform($qself __toggle {})"
+    --bind="ctrl-u:transform($qself __clear)"
   )
   (( preview )) && browse_args+=(--preview "$qself __preview {}"
                                  --preview-window='down,40%,wrap,border-top')
@@ -349,7 +377,7 @@ if (( browse )); then
   printf 'Browsing %s (needs fzf >= 0.45)\n' "$src_rsync" >&2
   rc=0
   fzf "${browse_args[@]}" </dev/null >/dev/null || rc=$?
-  # Only Ctrl-T (accept, rc 0) transfers; Esc/Ctrl-C aborts.
+  # Only Enter (accept, rc 0) transfers; Esc/Ctrl-C aborts.
   if (( rc == 0 )) && [[ -s $RFZ_BASKET ]]; then
     awk '!seen[$0]++' "$RFZ_BASKET" > "$picked"
   else
