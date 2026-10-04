@@ -28,7 +28,7 @@ rfz myserver:/srv/media/ ~/Downloads
 | Server | `sh`, `find`, and an SSH login. `fd` or `fdfind` is optional but faster |
 
 fzf versions: default mode works with any recent fzf, live mode (`-l`) needs
-0.38+, and browse mode (`-b`/`-D`) needs 0.45+.
+0.38+, and browse mode (`-b`) needs 0.45+.
 
 ## Install
 
@@ -58,7 +58,6 @@ home directory, and `host:` alone means the remote home.
 rfz myserver:/srv/media/ ~/dl                 # full listing, fuzzy filter
 rfz -l myserver:/srv/media/ ~/dl              # live server-side search
 rfz -b myserver:~ ./home-copy                 # browse directories
-rfz -D 3 myserver:projects/ ./projects        # browse, 3 levels visible at once
 rfz -n -x .git -x node_modules myserver:repo/ ./repo   # dry run with excludes
 rfz myserver:/data/ /mnt/backup -- --bwlimit=2000      # extra rsync flags
 ```
@@ -69,7 +68,6 @@ rfz myserver:/data/ /mnt/backup -- --bwlimit=2000      # extra rsync flags
 | ------ | ----------- |
 | `-l` | Live mode: search on the server per keystroke (best for huge trees) |
 | `-b` | Browse mode: navigate directories one level at a time |
-| `-D N` | Browse depth: show N levels at once (default 1, implies `-b`) |
 | `-s` | Shallow: list only the top level of SOURCE (default mode) |
 | `-n` | Dry run (`rsync --dry-run --itemize-changes`) |
 | `-y` | Skip the confirmation prompt |
