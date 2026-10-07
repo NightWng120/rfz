@@ -40,7 +40,7 @@ if [ -n "$FD" ]; then
   done
   set -- --hidden "$@"
   [ "$ignore" = 1 ] || set -- --no-ignore "$@"
-  [ "$shallow" = 1 ] && set -- --max-depth 1 "$@"
+  [ "$maxdepth" -gt 0 ] && set -- --max-depth "$maxdepth" "$@"
   {
     "$FD" "$@" -t d -- "$query" </dev/null 2>/dev/null | sed 's|/*$|/|'
     "$FD" "$@" -t f -t l -- "$query" </dev/null 2>/dev/null
@@ -49,7 +49,7 @@ else
   while [ "$i" -lt "$n" ]; do
     p=$1; shift; set -- "$@" ! -path "*/$p" ! -path "*/$p/*"; i=$((i + 1))
   done
-  depth=; [ "$shallow" = 1 ] && depth="-maxdepth 1"
+  depth=; [ "$maxdepth" -gt 0 ] && depth="-maxdepth $maxdepth"
   name='*'; [ -n "$query" ] && name="*$query*"
   {
     find . -mindepth 1 $depth "$@" -type d -iname "$name" </dev/null 2>/dev/null |
@@ -58,6 +58,14 @@ else
       sed -e 's|^\./||'
   } | cap
 fi
+EOS
+
+read -r -d '' RESOLVE_SCRIPT <<'EOS' || true
+case $root in
+  "~")   root=$HOME ;;
+  "~/"*) root=$HOME/${root#"~/"} ;;
+esac
+cd -- "$root" 2>/dev/null && pwd
 EOS
 
 read -r -d '' PREVIEW_SCRIPT <<'EOS' || true
@@ -98,7 +106,7 @@ run_sh() {
 }
 
 list_source() {   # list_source QUERY LIMIT(0 = unlimited)
-  run_sh "$LIST_SCRIPT" "root=$root" "shallow=$shallow" "ignore=$ignore" \
+  run_sh "$LIST_SCRIPT" "root=$root" "maxdepth=$shallow" "ignore=$ignore" \
                         "query=$1" "limit=$2"
 }
 
@@ -106,7 +114,8 @@ list_source() {   # list_source QUERY LIMIT(0 = unlimited)
 list_dir() {   # list_dir RELDIR -> one-level listing of ROOT/RELDIR
   local r=$root
   if [[ -n $1 ]]; then r="${root%/}/$1"; fi
-  run_sh "$LIST_SCRIPT" "root=$r" "shallow=1" "ignore=$ignore" "query=" "limit=0"
+  run_sh "$LIST_SCRIPT" "root=$r" "maxdepth=${RFZ_DEPTH:-1}" "ignore=$ignore" \
+                        "query=" "limit=0"
 }
 
 toggle_basket() {   # toggle_basket NAME -> add/remove ROOT-relative path
@@ -123,7 +132,7 @@ toggle_basket() {   # toggle_basket NAME -> add/remove ROOT-relative path
 }
 
 browse_nav() {   # browse_nav NAME -> enter dir/ or go up (../); returns 1 otherwise
-  local name=$1 cwd q
+  local name=$1 cwd q pos
   cwd=$(cat "$RFZ_CWDFILE")
   case $name in
     ../) if [[ $cwd == */* ]]; then cwd=${cwd%/*}; else cwd=""; fi ;;
@@ -132,7 +141,8 @@ browse_nav() {   # browse_nav NAME -> enter dir/ or go up (../); returns 1 other
   esac
   printf '%s' "$cwd" > "$RFZ_CWDFILE"
   q=$(printf '%q' "$RFZ_SELF")
-  printf 'clear-query+reload(%s __ls)+transform-header(%s __header)' "$q" "$q"
+  pos=""; if [[ -n $cwd ]]; then pos="+pos(2)"; fi   # skip the ../ row
+  printf 'clear-query+reload-sync(%s __ls)%s+transform-header(%s __header)' "$q" "$pos" "$q"
 }
 
 browse_refresh() {   # redraw list+header, keeping the cursor row (arg = rows to step)
@@ -252,11 +262,15 @@ SOURCE is a local dir or [user@]host:path. DEST may be local or remote.
 
 Options:
   -l          Live mode: search on the server per keystroke (huge trees)
-  -b          Browse mode: navigate directories one level at a time
+  -b          Browse mode: navigate directories (one level at a time by default)
+  -D N        Browse depth: show N levels at once, so you can jump straight
+              into a/b/c/ (default 1; implies -b)
   -s          Shallow: only the top level of SOURCE
   -n          Dry run (rsync --dry-run)
   -y          Skip the confirmation prompt
   -I          Respect .gitignore/.ignore files when listing (needs fd)
+  -R          Keep the folder structure of picked items under DEST
+              (default: each picked item lands directly in DEST)
   -x PATTERN  Exclude glob (repeatable), e.g. -x .git -x '*.log'
   -q QUERY    Initial fzf query
   -e CMD      SSH command, e.g. -e "ssh -p 2222 -i ~/.ssh/key"
@@ -277,17 +291,20 @@ Examples:
 EOF
 }
 
-live=0; browse=0; dry=0; assume_yes=0; query=""; ssh_base="ssh"; preview=1; mux=1
+live=0; browse=0; bdepth=1; keep_paths=0; dry=0; assume_yes=0; query=""; ssh_base="ssh"; preview=1; mux=1
 rs_excl=()
 
-while getopts ":lbsnyIx:q:e:PMh" opt; do
+while getopts ":lbD:snyIRx:q:e:PMh" opt; do
   case $opt in
     l) live=1 ;;
     b) browse=1 ;;
+    D) [[ $OPTARG =~ ^[1-9][0-9]*$ ]] || die "-D needs a positive number"
+       bdepth=$OPTARG ;;
     s) shallow=1 ;;
     n) dry=1 ;;
     y) assume_yes=1 ;;
     I) ignore=1 ;;
+    R) keep_paths=1 ;;
     x) patterns+=("$OPTARG"); rs_excl+=("--exclude=$OPTARG") ;;
     q) query=$OPTARG ;;
     e) ssh_base=$OPTARG ;;
@@ -299,6 +316,7 @@ while getopts ":lbsnyIx:q:e:PMh" opt; do
   esac
 done
 shift $((OPTIND - 1))
+(( bdepth > 1 )) && browse=1
 
 [[ $# -ge 2 ]] || { usage >&2; exit 1; }
 src=$1; dest=$2; shift 2
@@ -344,7 +362,7 @@ SELF="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]
 excl_joined=""
 if (( ${#patterns[@]} )); then excl_joined=$(printf '%s\n' "${patterns[@]}"); fi
 export RFZ_HOST="$host" RFZ_ROOT="$root" RFZ_SHALLOW="$shallow" RFZ_IGNORE="$ignore"
-export RFZ_SELF="$SELF" RFZ_DEST="$dest"
+export RFZ_SELF="$SELF" RFZ_DEST="$dest" RFZ_DEPTH="$bdepth"
 export RFZ_SSH="${ssh_cmd[*]}" RFZ_EXCL="$excl_joined" RFZ_BASKET="$tmp/basket"
 : > "$RFZ_BASKET"
 qself=$(printf '%q' "$SELF")
@@ -414,6 +432,12 @@ fi
 count=$(wc -l < "$picked" | tr -d ' ')
 
 # ---- 3. Confirm and transfer -------------------------------------------------
+# Without -R every item lands directly in DEST, so same-named items would collide.
+if (( ! keep_paths )); then
+  dup=$(sed -e 's|/*$||' -e 's|.*/||' "$picked" | sort | uniq -d | head -n 1)
+  [[ -z $dup ]] || die "more than one selected item is named '$dup' and would overwrite the other; use -R to keep folder structure, or select fewer items"
+fi
+
 printf '\nSelected %s item(s):\n' "$count" >&2
 head -n 15 "$picked" | sed 's/^/  /' >&2
 (( count > 15 )) && printf '  ... and %s more\n' "$((count - 15))" >&2
@@ -423,12 +447,35 @@ if (( ! assume_yes )); then
   [[ $ans =~ ^[Yy]$ ]] || { echo "Aborted." >&2; exit 0; }
 fi
 
-# With --files-from, -a doesn't imply -r, so pass -r so picked dirs recurse.
 # rsync -e is split on spaces, so ssh options here must not contain spaces.
-cmd=(rsync -ahr --info=progress2 --partial --files-from="$picked"
-     -e "${ssh_cmd[*]}")
-(( dry )) && cmd+=(--dry-run --itemize-changes)
-cmd+=(${rs_excl[@]+"${rs_excl[@]}"} ${extra[@]+"${extra[@]}"} "$src_rsync" "$dest")
+if (( keep_paths )); then
+  # --files-from implies --relative: picked paths keep their structure under DEST.
+  # -a doesn't imply -r with --files-from, so pass -r so picked dirs recurse.
+  cmd=(rsync -ahr --info=progress2 --partial --files-from="$picked"
+       -e "${ssh_cmd[*]}")
+  (( dry )) && cmd+=(--dry-run --itemize-changes)
+  cmd+=(${rs_excl[@]+"${rs_excl[@]}"} ${extra[@]+"${extra[@]}"} "$src_rsync" "$dest")
+else
+  # Resolve ROOT to an absolute path once (handles ~ and relative roots), then
+  # pass each picked item as its own source so it lands directly in DEST.
+  # Trailing slashes are dropped so a directory is copied as a directory.
+  abs_root=$(run_sh "$RESOLVE_SCRIPT" "root=$root") || abs_root=""
+  if [[ -n $abs_root ]]; then
+    base="${host:+$host:}${abs_root%/}/"
+  else
+    base=$src_rsync
+  fi
+  sources=()
+  while IFS= read -r item; do
+    item=${item%/}
+    if [[ -n $item ]]; then sources+=("$base$item"); fi
+  done < "$picked"
+
+  # -s (protect args) keeps spaces and glob characters in remote names intact.
+  cmd=(rsync -ahs --info=progress2 --partial -e "${ssh_cmd[*]}")
+  (( dry )) && cmd+=(--dry-run --itemize-changes)
+  cmd+=(${rs_excl[@]+"${rs_excl[@]}"} ${extra[@]+"${extra[@]}"} "${sources[@]}" "$dest")
+fi
 
 printf '\n+ %q ' "${cmd[@]}" >&2; echo >&2
 "${cmd[@]}"
